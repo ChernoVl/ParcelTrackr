@@ -3,7 +3,7 @@
  * - Structured logs (LOG.debug/info/warn/error with scopes + timing)
  * - Clear function docs + guard clauses
  * - Safe wrappers for Gmail/Sheets interactions
- * - Same functionality as v0.4, just easier to read/diagnose
+ * - Same functionality as v0.4, easier to read/diagnose
  */
 
 //////////////////////////////
@@ -26,6 +26,44 @@ const STATUS_ORDER = {
   'Shipped Back': 5,
   'Received': 6,
   'Refunded': 7
+};
+
+const ORDER_DEFAULTS = {
+  order_id: '',
+  // status core
+  status: '',
+  status_event_at: '',
+  status_changed_at: '',
+  status_history: '',
+  ordered_at: '',
+  shipped_at: '',
+  delivered_at: '',
+
+  // dates & ids
+  order_date_utc: '',
+  order_date_local: '',
+  gmail_message_id: '',
+  last_updated_at: '',
+
+  // parties & channel
+  buyer_email: '',
+  seller: '',
+  purchase_channel: '',
+
+  // money & first item
+  order_total: '',
+  shipping: '',
+  currency: '',
+  payment_method: '',
+  first_item_title: '',
+  first_item_image_url: '',
+  first_item_image_thumb: '',
+
+  // items summary (computed)
+  items_count: '',
+  items_total: '',
+  items_json: '',
+  items_summary: ''
 };
 
 //////////////////////////////
@@ -66,35 +104,12 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Amazon Sync')
     .addItem('Run Sync (write)', 'runSync')
-    .addItem('Dry Run (no writes)', 'runSyncDryRun')
     .addToUi();
 }
 
 //////////////////////////////
 // Entrypoints
 //////////////////////////////
-
-/** Dry run: classify + log only (no writes). */
-function runSyncDryRun() {
-  const sc = LOG.scope('DryRun');
-  try {
-    const cfg = readSettings_();
-    const messages = fetchCandidateEmails_(cfg.runWindowDays);
-    LOG.info('DryRun: messages fetched', { count: messages.length });
-    const rows = [];
-    for (const m of messages) {
-      const { type } = classifyEmail_(m);
-      rows.push(buildEmailLogRow_(m, 'DryRun', type, extractOrderId_(m.getSubject())));
-    }
-    if (rows.length) appendRows_(SHEETS.EMAIL_LOG, rows);
-    LOG.info('DryRun complete', { emailLogs: rows.length });
-  } catch (e) {
-    LOG.error('DryRun failure', { err: String(e) });
-    throw e;
-  } finally {
-    sc.end();
-  }
-}
 
 /** Full run: parse, upsert, and log. */
 function runSync() {
@@ -111,7 +126,7 @@ function runSync() {
 
     // Accumulators
     const counts = { OrderConfirm:0, Shipment:0, Delivery:0, Return:0, Refund:0, Other:0 };
-    const ordersUpserts = [], returnsUpserts = [], refundsAppends = [], emailLogs = [];
+    const ordersUpserts = [], returnsUpserts = [], emailLogs = [];
     const itemsByOrder = new Map(); // order_id -> merged items
 
     for (const msg of messages) {
@@ -124,54 +139,49 @@ function runSync() {
       let parseResult = 'Success';
       let notes = '';
       let orderId = '';
-      const { type } = classifyEmail_(msg);
+      const content = getMessageContent_(msg);
+      //LOG.debug(content.plainText);
+      const { type } = classifyEmail_(content.subject);
       counts[type] = (counts[type] || 0) + 1;
 
       try {
-        const content = getMessageContent_(msg);
-        const combined  = content.subject + ' ' + content.plainText + ' ' + content.htmlText;
-        orderId = extractOrderId_(combined) || '';
+        orderId = extractOrderId_(content.plainText) || '';
+        if (!orderId) throw new Error('No order_id found (Ordered)');
 
         switch (type) {
-          case 'OrderConfirm': {
-            const o = parseOrderConfirm_(content, cfg.tz);
-            if (!o.order_id && orderId) o.order_id = orderId;
-            if (!o.order_id) throw new Error('No order_id found (OrderConfirm)');
-            o.last_updated_at = isoNow_(cfg.tz);
-            ordersUpserts.push(o);
-
-            // Merge items per order_id across any emails
-            if (o._items && o._items.length) {
-              const prev = itemsByOrder.get(o.order_id) || [];
-              itemsByOrder.set(o.order_id, mergeItemArrays_(prev, o._items));
-              LOG.debug('Items merged', { order_id: o.order_id, items: itemsByOrder.get(o.order_id).length });
-            }
+          case 'Ordered': {
+            const o = parseOrdered_(orderId, content, cfg.tz);
+            ordersUpserts.push(ensureOrderShape_(o));
             break;
           }
-          case 'Shipment': {
-            const o = parseShipment_(content, cfg.tz);
-            if (!o.order_id && orderId) o.order_id = orderId;
-            if (o.order_id) { o.last_updated_at = isoNow_(cfg.tz); ordersUpserts.push(o); }
+          case 'Shipped': {
+            const o = parseShipped_(content, cfg.tz);
+            ordersUpserts.push(ensureOrderShape_(o));
             break;
           }
-          case 'Delivery': {
-            const o = parseDelivery_(content, cfg.tz);
-            if (!o.order_id && orderId) o.order_id = orderId;
-            if (o.order_id) { o.last_updated_at = isoNow_(cfg.tz); ordersUpserts.push(o); }
+          case 'Delivered': {
+            const o = parseDelivered_(content, cfg.tz);
+            ordersUpserts.push(ensureOrderShape_(o));
             break;
           }
-          case 'Return': {
-            const r = parseReturn_(content, cfg.tz);
-            if (!r.order_id && orderId) r.order_id = orderId;
-            if (!r.order_id) throw new Error('No order_id found (Return)');
-            returnsUpserts.push(r);
+          case 'Cancelled': {
+            const o = parseCancelled_(content, cfg.tz);
+            ordersUpserts.push(ensureOrderShape_(o));
             break;
           }
-          case 'Refund': {
-            const rf = parseRefund_(content, cfg.tz);
-            if (!rf.order_id && orderId) rf.order_id = orderId;
-            if (!rf.order_id) throw new Error('No order_id found (Refund)');
-            refundsAppends.push(rf);
+          case 'ReturnRequested': {
+            const rr = parseReturnRequested_(content, cfg.tz);
+            returnsUpserts.push(rr);
+            break;
+          }
+          case 'ReturnDropoffConfirmed': {
+            const rdc = parseReturnDropoffConfirmed_(content, cfg.tz);
+            returnsUpserts.push(rdc);
+            break;
+          }
+          case 'RefundIssued': {
+            const rf = parseRefundIssued_(content, cfg.tz);
+            returnsUpserts.push(rf);
             break;
           }
           default:
@@ -199,10 +209,6 @@ function runSync() {
     if (returnsUpserts.length) {
       LOG.info('Upserting Returns', { count: returnsUpserts.length });
       upsertMany_(SHEETS.RETURNS, 'return_id', returnsUpserts);
-    }
-    if (refundsAppends.length) {
-      LOG.info('Appending Refunds', { count: refundsAppends.length });
-      appendRows_(SHEETS.REFUNDS, refundsAppends);
     }
     if (emailLogs.length) {
       LOG.info('Appending EmailLog', { count: emailLogs.length });
@@ -309,20 +315,16 @@ function markParsed_(msg) {
 //////////////////////////////
 
 /** Lightweight subject classifier. */
-function classifyEmail_(msg) {
-  const s = (msg.getSubject() || '').toLowerCase().trim();
+function classifyEmail_(subject) {
+  const s = String(subject || '').toLowerCase().trim();
 
-  if (
-    /^ordered[:\-]/i.test(s) ||
-    /(order\s+placed|order\s+confirmed|order\s+confirmation)/i.test(s) ||
-    /(your order|thanks for your order)/i.test(s)
-  ) return { type: 'OrderConfirm' };
-
-  if (/refund/i.test(s)) return { type: 'Refund' };
-  if (/return/i.test(s)) return { type: 'Return' };
-
-  if (/(delivered|your package was delivered)/i.test(s)) return { type: 'Delivery' };
-  if (/(shipped|has shipped|out for delivery|on the way|package was shipped)/i.test(s)) return { type: 'Shipment' };
+  if (s.startsWith('ordered:')) return { type: 'Ordered' };
+  if (s.startsWith('shipped:') || s.includes('on the way')) return { type: 'Shipped' };
+  if (s.startsWith('delivered:')) return { type: 'Delivered' };
+  if (s.includes('has been canceled')) return { type: 'Cancelled' };
+  if (s.startsWith('your refund for')) return { type: 'RefundIssued' };
+  if (s.startsWith('your return drop off confirmation')) return { type: 'ReturnDropoffConfirmed' };
+  if (s.startsWith('your return of')) return { type: 'ReturnRequested' };
 
   return { type: 'Other' };
 }
@@ -331,149 +333,403 @@ function classifyEmail_(msg) {
 // Parsers
 //////////////////////////////
 
-function parseOrderConfirm_(content, tz) {
-  const order_id = extractOrderId_(content.subject + ' ' + content.plainText + ' ' + content.htmlText);
-
-  const order_date_utc   = iso_(content.date, 'Etc/UTC');
-  const order_date_local = iso_(content.date, tz);
-
-  const currency = inferCurrency_(content.plainText, content.htmlText);
-
-  let order_total = extractLabeledAmount_(content.plainText, ['Order Total','Grand Total','Total']);
-  if (order_total == null) order_total = extractLabeledAmountHTML_(content.htmlText, ['Order Total','Grand Total','Total']);
-
-  let shipping = extractLabeledAmount_(content.plainText, ['Shipping','Delivery']);
-  if (shipping == null) shipping = extractLabeledAmountHTML_(content.htmlText, ['Shipping','Delivery']);
-
-  const pay = extractPayment_(content.plainText + ' ' + content.htmlText);
+function parseOrdered_(order_id, content, tz) {
+  const order_date_local = iso_(content.date, tz || 'Etc/UTC');
+  const currency = inferCurrency_(content.plainText);
+  let order_total = extractTotalAmount_(content.plainText);
   const purchase_channel = inferPurchaseChannel_(content.from, content.htmlText);
-  const seller = extractSeller_(content.htmlText, content.plainText) || 'Amazon';
-  const product = extractFirstProduct_(content.htmlText, content.plainText);
-
-  // Parse all items (title, qty, unit price)
-  const items = extractLineItems_(content.htmlText, content.plainText);
+  const seller = content.from;
+  const items = extractLineItems_(content.plainText); // Parse all items (title, qty, unit price)
+  const view_order_link = extractOrderViewLink_(content.plainText);
 
   const o = {
     order_id,
-    order_date_utc,
     order_date_local,
     buyer_email: (content.to || '').split(',')[0] || '',
     seller,
     order_total: order_total != null ? order_total : '',
-    shipping: shipping != null ? shipping : '',
     currency: currency || '',
-    payment_method: pay.method,
     purchase_channel,
     status: 'Ordered',
-    status_event_at: iso_(content.date, tz),
-
     gmail_message_id: content.id,
-    first_seen_email_id: content.id,
     last_updated_at: isoNow_(tz),
-
+    view_order_link,
     _items: items // carried to runner; not stored directly in Orders
   };
 
-  if (product.title) o.first_item_title = product.title;
-  if (product.imageUrl) {
-    o.first_item_image_url = product.imageUrl;
-    o.first_item_image_thumb = `=IMAGE("${product.imageUrl.replace(/"/g,'""')}",4,60,60)`;
-  }
   return o;
 }
 
-function parseShipment_(content, tz) {
-  const order_id = extractOrderId_(content.subject + ' ' + content.plainText + ' ' + content.htmlText);
-  return { order_id, status: 'Shipped', status_event_at: iso_(content.date, tz) };
-}
-function parseDelivery_(content, tz) {
-  const order_id = extractOrderId_(content.subject + ' ' + content.plainText + ' ' + content.htmlText);
-  return { order_id, status: 'Delivered', status_event_at: iso_(content.date, tz) };
-}
-
-function parseReturn_(content, tz) {
-  const combined = content.subject + ' ' + content.plainText;
-  const order_id = extractOrderId_(combined);
-  let status = 'Requested';
-  if (/drop\s*off confirmation|was dropped off/i.test(combined)) status = 'Shipped Back';
-  if (/return (received|processed)/i.test(combined)) status = 'Received';
-
-  const qrLink = extractHrefByText_(content.htmlText, ['Download QR Code','QR code','Return code']);
-  const qrImg  = extractImageByAltOrNearText_(content.htmlText, ['Return code','QR']);
-
-  const return_id = order_id ? `${order_id}-ret-${formatDateId_(content.date, tz)}` : `ret-${content.id}`;
-  const r = {
-    return_id,
-    order_id,
-    qty_returned: '',
-    return_requested_at: status === 'Requested' ? iso_(content.date, tz) : '',
-    return_approved_at: status === 'Received' ? iso_(content.date, tz) : '',
-    return_carrier: '',
-    rma_label_id: '',
-    return_reason: '',
-    status
+function parseShipped_(content, tz) {
+  return { 
+    order_id: extractOrderId_(content.plainText), 
+    status: 'Shipped', 
+    status_event_at: iso_(content.date, tz) ,
+    last_updated_at: isoNow_(tz),
   };
-  if (qrLink) r.return_qr_link = qrLink;
-  if (qrImg)  r.return_qr_image_url = qrImg;
-  return r;
+}
+function parseDelivered_(content, tz) {
+  return { 
+    order_id: extractOrderId_(content.plainText),
+    status: 'Delivered', 
+    status_event_at: iso_(content.date, tz),
+    last_updated_at: isoNow_(tz),
+  };
+}
+function parseCancelled_(content, tz) {
+  return { 
+    order_id: extractOrderId_(content.plainText),
+    status: 'Cancelled', 
+    status_event_at: iso_(content.date, tz),
+    last_updated_at: isoNow_(tz),
+  };
 }
 
-function parseRefund_(content, tz) {
-  const order_id = extractOrderId_(content.subject + ' ' + content.plainText + ' ' + content.htmlText);
-  const refund_total = extractLabeledAmount_(content.plainText, ['Total refund','Refund subtotal','Refund total','Refund','Refunded']) ??
-                       largestAmount_(content.plainText);
-  const currency = inferCurrency_(content.plainText, content.htmlText);
-  const refund_id = order_id ? `${order_id}-rf-${formatDateId_(content.date, tz)}` : `rf-${content.id}`;
-  const reason = extractAfterLabel_(content.plainText, ['Reason','Reason for refund']);
+/**
+ * ReturnRequested_
+ */
+/** Parse a "ReturnRequested" email (PLAIN TEXT ONLY)
+ * Returns only the fields you asked for:
+ * - order_id
+ * - request_at            (ISO, from email date)
+ * - gmail_message_id
+ * - last_updated_at       (ISO now)
+ * - refund_subtotal       (number)
+ * - total_estimated_refund(number)
+ * - shipping_amount       (number)
+ * - dropoff_by_date       (ISO date, no time)
+ * - dropoff_location      (string)
+ * - items                 ([{title, qty}])
+ */
+function parseReturnRequested_(content, tz) {
+  const tzUse = tz || Session.getScriptTimeZone() || 'Etc/UTC'; // FIXME add to all parcers
+
+  const plain = String(content.plainText || '')
+    .replace(/\r/g, '')
+    .replace(/\n{3,}/g, '\n\n'); // compact triple+ newlines to double
+
+  const order_id  = extractOrderId_(plain);
+  const request_at = iso_(content.date, tzUse);
+  const gmail_message_id = content.id;
+  const last_updated_at  = isoNow_(tzUse);
+
+  const refund_subtotal        = _findAmountAfterLabel_(plain, /refund subtotal/i);
+  const total_estimated_refund = _findAmountAfterLabel_(plain, /total estimated refund/i);
+  const shipping_amount        = _findAmountAfterLabel_(plain, /shipping/i);
+
+  const dropoff_by_date   = _extractDropoffByDate_(plain, tzUse, content.date);
+  const dropoff_location  = _extractDropoffLocation_(plain);
+
+  const { items } = _extractBracketedItemsWithQuantities_(plain);
 
   return {
-    refund_id,
     order_id,
-    item_id: '',
-    refund_email_type: 'Issued',
-    amount_items: '',
-    amount_tax: '',
-    amount_shipping: '',
-    amount_other: '',
-    currency: currency || '',
-    refund_total: refund_total != null ? refund_total : '',
-    refund_initiated_at: '',
-    refund_issued_at: iso_(content.date, tz),
-    reason: reason || ''
+    request_at,
+    gmail_message_id,
+    last_updated_at,
+    refund_subtotal,
+    total_estimated_refund,
+    shipping_amount,
+    dropoff_by_date,
+    dropoff_location,
+    items
   };
 }
+function _findAmountAfterLabel_(s, labelRegex) { //FIXME duplicate
+  if (!s) return '';
+  // Match lines like: "<Label>  $12.34" or "<Label>:  $12.34"
+  const re = new RegExp(String(labelRegex.source) + `[\\s:\\-]*([\\$€£]?\\s?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?)`, 'i');
+  const m = s.match(re);
+  return m ? normalizeAmount_(m[1]) : '';
+}
+function _extractDropoffByDate_(s, tz, fallbackDate) {
+  const rx = /dropoff by\s*:\s*([\w]{3,},?\s+[A-Za-z]{3}\s+\d{1,2})/i;
+  const m = s.match(rx);
+  if (!m) return '';
+  const txt = m[1].trim();            // e.g., "Mon, Aug 18"
+  const year = (fallbackDate instanceof Date) ? fallbackDate.getFullYear() : new Date().getFullYear();
+
+  // Parse "Mon, Aug 18"
+  const m2 = txt.match(/^[A-Za-z]{3,},?\s+([A-Za-z]{3})\s+(\d{1,2})$/);
+  if (!m2) return '';
+  const mon = m2[1].toLowerCase();
+  const day = Number(m2[2]);
+  const monthMap = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+  if (!(mon in monthMap) || !day) return '';
+
+  // Build date at local midnight in tz
+  const d = new Date(year, monthMap[mon], day, 0, 0, 0);
+  // Return just the date part in ISO (YYYY-MM-DD); if you prefer full ISO with tz, use iso_(d, tz)
+  return Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+}
+function _extractDropoffLocation_(s) {
+  const lines = String(s || '').split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (/^dropoff location/i.test(lines[i].trim())) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const L = lines[j].trim();
+        if (L) return L;
+      }
+    }
+  }
+  return '';
+}
+function _extractBracketedItemsWithQuantities_(s) {
+  const lines = String(s || '').split('\n');
+  const items = [];
+  let title = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i].trim();
+    if (!L) continue;
+
+    // [Title] or [Title](...)
+    const mt = L.match(/^\[([^\]]{4,})\](?:\([^)]+\))?/);
+    if (mt) { title = mt[1].trim(); continue; }
+
+    if (title) {
+      const mq = L.match(/^quantity\s*:\s*(\d+)/i);
+      if (mq) {
+        items.push({ title, qty: Math.max(1, Number(mq[1])) });
+        title = '';
+      }
+    }
+  }
+  return { items };
+}
+
+/**
+ * parseReturnDropoffConfirmed_
+ */
+/** Parse a "ReturnDropoffConfirmed" email (PLAIN TEXT ONLY)
+ * Returns ONLY:
+ * - order_id
+ * - dropoff_at                  (ISO from email date)
+ * - refund_subtotal             (number)
+ * - shipping_amount             (number)
+ * - total_estimated_refund      (number)
+ * - refund_card_last4           (string '3792' or '')
+ * - items                       ([{title, qty}])
+ */
+function parseReturnDropoffConfirmed_(content, tz) {
+  const tzUse = tz || Session.getScriptTimeZone() || 'Etc/UTC';
+
+  const plain = String(content.plainText || '');
+  const order_id = extractOrderId_(plain);
+  const dropoff_at = iso_(content.date, tzUse);
+  const refund_subtotal        = _findAmountAfterLabel_(plain, /refund subtotal/i);
+  const shipping_amount        = _findAmountAfterLabel_(plain, /shipping/i);
+  const total_estimated_refund = _findAmountAfterLabel_(plain, /total estimated refund/i);
+  const refund_card_last4 = _extractCardLast4_(plain);
+  const items = _extractBracketedItemsWithQuantities_(plain);
+
+  LOG.debug('[ReturnDropoffConfirmed]', {order_id}, {total_estimated_refund});
+
+  return {
+    order_id,
+    dropoff_at,
+    refund_subtotal,
+    shipping_amount,
+    total_estimated_refund,
+    refund_card_last4,
+    items
+  };
+}
+function _findAmountAfterLabel_(s, labelRegex) {// Fixme exist
+  if (!s) return '';
+  const re = new RegExp(String(labelRegex.source) + `[\\s:\\-]*([\\$€£]?\\s?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?)`, 'i');
+  const m = s.match(re);
+  return m ? normalizeAmount_(m[1]) : '';
+}
+function _extractCardLast4_(s) {
+  const m = String(s || '').match(/ending\s+(?:in|with)\s*(\d{4})/i);
+  return m ? m[1] : '';
+}
+function _extractBracketedItemsWithQuantities_(s) {
+  const lines = String(s || '').split('\n');
+  const out = [];
+  let currentTitle = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i].trim();
+    if (!L) continue;
+
+    // [Title] or [Title](...)
+    const mt = L.match(/^\[([^\]]{4,})\](?:\([^)]+\))?/);
+    if (mt) { currentTitle = mt[1].trim(); continue; }
+
+    // Quantity after a captured title
+    if (currentTitle) {
+      const mq = L.match(/^quantity\s*:\s*(\d+)/i);
+      if (mq) {
+        out.push({ title: currentTitle, qty: Math.max(1, Number(mq[1])) });
+        currentTitle = '';
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * RefundIssued_
+ */
+function parseRefundIssued_(content, tz) {
+  const src = String(content.plainText || '');
+  const refundText = _cutRefundMainSection_(src);
+
+  const order_id          = extractOrderId_(refundText);
+  const { refund_subtotal, total_refund } = _extractRefundAmounts_(refundText);
+  const refund_card_last4 = _extractCardLast4_(refundText);
+  const invoice_link      = _extractInvoiceLink_(refundText);
+  const { items, items_count } = _extractItemsFromRefund_(refundText);
+
+  const row = {
+    order_id,
+    refund_subtotal: refund_subtotal != null ? refund_subtotal : '',
+    total_refund:    total_refund    != null ? total_refund    : '',
+    refund_card_last4: refund_card_last4 || '',
+    items_json: JSON.stringify(items),
+    items_count,
+    invoice_link: invoice_link || '',
+    refund_issued_at: iso_(content.date, tz),
+    status: "RefundIssued"
+  };
+
+  Logger.log(
+    '[RefundIssued] order=%s subtotal=%s total=%s last4=%s items=%s invoice=%s',
+    row.order_id, row.refund_subtotal, row.total_refund, row.refund_card_last4, row.items_count, row.invoice_link
+  );
+
+  return row;
+}
+function _cutRefundMainSection_(plain) {
+  let cut = String(plain || '');
+  const ixProducts = cut.search(/^\s*products related to your return\b/i);
+  if (ixProducts >= 0) return cut.slice(0, ixProducts);
+
+  const lines = cut.split('\n');
+  let endIdx = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^view invoice\b/i.test(lines[i])) {
+      // include the URL line if present
+      if (i + 1 < lines.length && /^https?:\/\//i.test(lines[i + 1].trim())) {
+        endIdx = i + 2;
+      } else {
+        endIdx = i + 1;
+      }
+      break;
+    }
+  }
+  return lines.slice(0, endIdx).join('\n');
+}
+function _extractRefundAmounts_(s) {
+  const refund_subtotal = _amountAfterLabel_(s, /refund subtotal/i);
+  const total_refund    = _amountAfterLabel_(s, /total refund/i);
+  return { refund_subtotal, total_refund };
+}
+function _extractCardLast4_(s) {
+  const m = s.match(/ending\s+in\s+(\d{4})/i);
+  return m ? m[1] : '';
+}
+function _extractInvoiceLink_(s) {
+  let m = s.match(/view invoice\s*\((https?:\/\/[^\s)]+)\)/i);
+  if (m) return m[1];
+
+  const lines = s.split('\n').map(x => x.trim());
+  for (let i = 0; i < lines.length; i++) {
+    if (/^view invoice$/i.test(lines[i]) && lines[i + 1] && /^https?:\/\//i.test(lines[i + 1])) {
+      return lines[i + 1];
+    }
+  }
+  return '';
+}
+function _extractItemsFromRefund_(s) {
+  const lines = String(s || '').split('\n');
+  const items = [];
+  let pendingTitle = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i].trim();
+    if (!L) continue;
+
+    // Title: [Some Item ...] OR [Some Item ...](https://...)
+    const mTitle = L.match(/^\[([^\]]{4,})\](?:\([^)]+\))?/);
+    if (mTitle) { 
+      pendingTitle = mTitle[1].trim();
+      continue;
+    }
+
+    // Quantity line comes after the title
+    if (pendingTitle) {
+      const mQty = L.match(/^quantity\s*:\s*(\d+)/i);
+      if (mQty) {
+        const qty = Math.max(1, Number(mQty[1]));
+        items.push({ title: pendingTitle, qty });
+        pendingTitle = '';
+      }
+    }
+  }
+
+  const items_count = items.reduce((sum, it) => sum + (it.qty || 0), 0);
+  return { items, items_count };
+}
+function _amountAfterLabel_(s, labelRe) {
+  const re = new RegExp(labelRe.source + '\\s*[:\\-]?\\s*\\$?\\s*(\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2}))', 'i');
+  const m = s.match(re);
+  return m ? normalizeAmount_(m[1]) : null;
+}
+
+
 
 //////////////////////////////
 // Helpers: message, text, regex
 //////////////////////////////
 
-function getMessageContent_(msg) {
+function getMessageContent_(msg) { 
   const subject = msg.getSubject() || '';
-  const htmlText = (msg.getBody() || '').replace(/\r/g, '\n');
-  const plainText = (msg.getPlainBody() || '').replace(/\r/g, '\n');
+  const htmlText = (msg.getBody() || '')
+    .replace(/\r/g, '\n')
+    .replace(/\n{3,}/g, '\n\n'); // collapse 3+ newlines into 2
+  const plainText = (msg.getPlainBody() || '')
+    .replace(/\r/g, '\n')
+    .replace(/\n{3,}/g, '\n\n'); // same for plain text
+
   return {
     id: msg.getId(),
     threadId: msg.getThread().getId(),
-    subject, htmlText, plainText, date: msg.getDate(),
-    from: msg.getFrom() || '', to: msg.getTo() || '', label: LABELS.TO_PARSE
+    subject,
+    htmlText,
+    plainText,
+    date: msg.getDate(),
+    from: msg.getFrom() || '',
+    to: msg.getTo() || '',
+    label: LABELS.TO_PARSE
   };
 }
 function extractOrderId_(text) {
   const m = String(text || '').match(/(\d{3}-\d{7}-\d{7})/);
   return m ? m[1] : '';
 }
-function inferCurrency_(plain, html) {
-  if (/\$\s?\d/.test(plain+html)) return 'USD';
-  if (/€\s?\d/.test(plain+html))  return 'EUR';
-  if (/£\s?\d/.test(plain+html))  return 'GBP';
+function inferCurrency_(plain) {
+  const text = String(plain || '');
+  // Look for something like "56.96 USD" or "9,99 EUR"
+  const m = text.match(/\b\d[\d,]*(?:\.\d{2})?\s*(USD|EUR|GBP|AUD|CAD|JPY|INR)\b/i);
+  if (m) return m[1].toUpperCase();
   return '';
 }
-function extractLabeledAmount_(text, labels) {
+function extractTotalAmount_(text) {
   if (!text) return null;
-  for (const label of labels) {
-    const re = new RegExp(label + '\\s*[:\\-]?\\s*([\\$€£]?\\s?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?)', 'i');
-    const m = text.match(re);
-    if (m) return normalizeAmount_(m[1]);
+  const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
+
+  for (let i = 0; i < lines.length; i++) {
+    if (/^total$/i.test(lines[i])) {
+      const next = lines[i + 1];
+      if (next) {
+        // extract numeric part, e.g. "56.96 USD" → "56.96"
+        const m = next.match(/(\d+(?:\.\d{2})?)/);
+        return m ? parseFloat(m[1]) : null;
+      }
+    }
   }
   return null;
 }
@@ -502,33 +758,6 @@ function formatDateId_(date, tz) { return Utilities.formatDate(date, tz, 'yyyyMM
 // Product/QR scraping
 //////////////////////////////
 
-function extractFirstProduct_(html, plain) {
-  const out = { title:'', imageUrl:'' };
-  try {
-    const titles = [];
-    const reA = /<a\b[^>]*>([^<]{8,120})<\/a>/gi;
-    let m;
-    while ((m = reA.exec(html))) {
-      const t = m[1].replace(/\s+/g,' ').trim();
-      if (!t) continue;
-      if (/your orders|your account|buy again|track package/i.test(t)) continue;
-      titles.push(t);
-    }
-    titles.sort((a,b)=>b.length-a.length);
-    if (titles.length) out.title = titles[0];
-
-    const reImg = /<img\b[^>]*src="([^"]+m\.media-amazon\.com[^"]+)"[^>]*>/gi;
-    const im = reImg.exec(html);
-    if (im) out.imageUrl = im[1];
-  } catch(_) {}
-
-  if (!out.title && /quantity\s*:\s*\d/i.test(plain)) {
-    const lines = plain.split('\n').map(s=>s.trim()).filter(Boolean);
-    const qix = lines.findIndex(l=>/quantity\s*:\s*\d/i.test(l));
-    if (qix>0) out.title = lines[qix-1].slice(0,140);
-  }
-  return out;
-}
 function extractHrefByText_(html, texts) {
   for (const t of texts) {
     const rx = new RegExp(`<a[^>]+href="([^"]+)"[^>]*>\\s*${t}\\s*<\\/a>`, 'i');
@@ -676,25 +905,6 @@ function extractLabeledAmountHTML_(html, labels) {
 // Payment / Marketplace
 //////////////////////////////
 
-function extractPayment_(plainPlusHtml) {
-  const t = String(plainPlusHtml || '').toLowerCase();
-  if (/monthly payments?/.test(t)) return { method: 'Amazon Monthly Payments', last4: '' };
-
-  const cards = ['visa','mastercard','master card','american express','amex','discover','amazon store card','amazon secured card','gift card'];
-  let method = '';
-  for (const c of cards) {
-    const re = new RegExp(c.replace(' ', '\\s+'), 'i');
-    if (re.test(t)) { method = c.replace(/\b\w/g, s => s.toUpperCase()); break; }
-  }
-  let last4 = '';
-  const m = t.match(/ending(?:\s+in|\s+with)?\s*(\d{4})|last\s*4\s*digits\s*(\d{4})/i);
-  if (m) last4 = (m[1] || m[2] || '').trim();
-
-  if (!method && last4) method = 'Card';
-  if (method === 'Amex') method = 'American Express';
-  if (method) return { method, last4 };
-  return { method: '', last4: '' };
-}
 function inferPurchaseChannel_(fromStr, html) {
   const s = (fromStr + ' ' + html).toLowerCase();
   if (s.includes('amazon.com')) return 'US';
@@ -728,70 +938,51 @@ function objToRow_(headers, obj) {
 function mergeOrder_(existing, incoming) {
   const out = Object.assign({}, existing);
 
-  // Copy non-empty scalars (never wipe with '')
+  // copy non-empty scalars (never wipe with '')
   for (const [k, v] of Object.entries(incoming)) {
     if (k === 'status' || k === 'status_event_at') continue; // handled below
-    if (k === 'order_total' && existing.order_total) {
-      // protect order_total from being overwritten by empties/smaller shipment subtotals
-      if (v !== '' && v !== null && v !== undefined && Number(v) > Number(existing.order_total)) {
-        out[k] = v; // accept upgrade
+
+    if (k === 'order_total') {
+      // set-once only
+      if (!existing.order_total && v !== '' && v !== null && v !== undefined) {
+        out.order_total = v;
       }
       continue;
     }
+
     if (v !== '' && v !== null && v !== undefined) out[k] = v;
   }
 
-  // seed first_seen_* once
-  if (!existing.first_seen_email_id && (incoming.gmail_message_id || incoming.first_seen_email_id)) {
-    out.first_seen_email_id = incoming.gmail_message_id || incoming.first_seen_email_id;
-  }
-  if (!existing.first_seen_at && incoming.first_seen_at) out.first_seen_at = incoming.first_seen_at;
+  // --- status + history (newest first) ---
+  const newStatus = String(incoming.status || '').trim();
+  const eventAt   = incoming.status_event_at || incoming.last_updated_at || '';
 
-  // Status history
+  // if incoming has a status, adopt it as current
+  if (newStatus) {
+    out.status = newStatus;
+    if (eventAt) out.status_changed_at = eventAt;
+  }
+
+  // parse existing history (if any)
   let history = [];
   try { history = existing.status_history ? JSON.parse(existing.status_history) : []; }
   catch (_) { history = []; }
 
-  const addHist = (st, at) => {
-    if (!st || !at) return;
-    if (history.some(h => String(h.status) === st && String(h.at) === at)) return;
-    history.push({ status: st, at: at });
-  };
-  const sortHist = () => history.sort((a,b) => String(a.at).localeCompare(String(b.at)));
+  // build key for dedupe
+  const key = (h) => `${String(h.status||'').trim()}::${String(h.at||'').trim()}`;
 
-  // Anti-downgrade
-  const oldStatus = String(existing.status || '').trim();
-  const newStatus = String(incoming.status || '').trim();
-  const eventAt   = incoming.status_event_at || incoming.last_updated_at || '';
+  // prepend newest
+  if (newStatus && eventAt) {
+    const newest = { status: newStatus, at: eventAt };
+    const newestKey = key(newest);
+    const deduped = [newest];
 
-  const rank = s => STATUS_ORDER[s] || 0;
-  const oldRank = rank(oldStatus);
-  const newRank = rank(newStatus);
-
-  if (newStatus && eventAt) addHist(newStatus, eventAt);
-
-  if (!oldStatus && newStatus) {
-    out.status = newStatus;
-    out.status_changed_at = eventAt || out.status_changed_at || '';
-  } else if (newStatus) {
-    if (newRank > oldRank) {
-      out.status = newStatus;
-      out.status_changed_at = eventAt || out.status_changed_at || '';
-    } else if (newRank === oldRank) {
-      if (eventAt && (!existing.status_changed_at || String(eventAt) > String(existing.status_changed_at))) {
-        out.status_changed_at = eventAt;
-      }
+    for (const h of history) {
+      if (key(h) !== newestKey) deduped.push(h);
     }
+    history = deduped; // newest-first
   }
 
-  const setOnce = (field, st) => {
-    if (newStatus === st && eventAt && !existing[field]) out[field] = eventAt;
-  };
-  setOnce('ordered_at',   'Ordered');
-  setOnce('shipped_at',   'Shipped');
-  setOnce('delivered_at', 'Delivered');
-
-  sortHist();
   out.status_history = JSON.stringify(history);
   return out;
 }
@@ -804,35 +995,37 @@ function upsertOrdersWithStatus_(objs) {
   const { sh, headers } = getHeaders_(SHEETS.ORDERS);
   let hdrs = headers.slice();
 
+  // Ensure only the columns we still care about (kept your item summaries)
   [
-    'status','status_changed_at','status_history','ordered_at','shipped_at','delivered_at',
+    'status','status_changed_at','status_history',
+    'ordered_at','shipped_at','delivered_at', // keep if you still want these timestamps (optional)
     'order_date_utc','order_date_local','buyer_email','seller','order_total','shipping',
-    'currency','payment_method','purchase_channel','first_seen_email_id',
+    'currency','payment_method','purchase_channel',
     'last_updated_at','first_item_title','first_item_image_url','first_item_image_thumb',
     'items_count','items_total','items_json','items_summary'
   ].forEach(c => { if (!hdrs.includes(c)) { hdrs.push(c); sh.getRange(1, hdrs.length, 1, 1).setValue(c); } });
 
   SpreadsheetApp.flush();
 
-  // Build index of existing rows
+  // index existing rows by order_id (col A)
   const lastRow = sh.getLastRow();
-  const index = new Map(); // order_id -> row
+  const index = new Map();
   if (lastRow > 1) {
-    const ids = sh.getRange(2, 1, lastRow - 1, 1).getValues(); // column A = order_id
+    const ids = sh.getRange(2, 1, lastRow - 1, 1).getValues();
     for (let i = 0; i < ids.length; i++) {
       const id = String(ids[i][0] || '').trim();
       if (id && !index.has(id)) index.set(id, i + 2);
     }
   }
 
-  // Cache row obj to avoid rereads
-  const cache = new Map(); // row -> obj
+  // cache (row -> obj) to avoid rereads
+  const cache = new Map();
 
   for (const incoming of objs) {
     const id = String(incoming.order_id || '').trim();
     if (!id) continue;
 
-    // If incoming carries parsed items, fold into row fields
+    // fold parsed items into row summary fields (if present)
     if (incoming._items && incoming._items.length) {
       const itemFields = summarizeItemsForOrderRow_(incoming._items);
       Object.assign(incoming, itemFields);
@@ -840,6 +1033,7 @@ function upsertOrdersWithStatus_(objs) {
 
     let row = index.get(id);
     if (!row) {
+      // brand new row → write-through append
       const seeded = mergeOrder_({}, incoming);
       row = sh.getLastRow() + 1;
       sh.getRange(row, 1, 1, hdrs.length).setValues([objToRow_(hdrs, seeded)]);
@@ -848,11 +1042,25 @@ function upsertOrdersWithStatus_(objs) {
       continue;
     }
 
+    // existing row → merge and update
     let current = cache.get(row);
     if (!current) {
       current = rowToObj_(hdrs, sh.getRange(row, 1, 1, hdrs.length).getValues()[0]);
     }
+
+    // if you still want to stamp ordered/shipped/delivered once, do it here (optional):
+    // when adopting incoming status as current, set the per-status field if empty.
     const merged = mergeOrder_(current, incoming);
+    const st     = String(merged.status || '').trim();
+    const at     = merged.status_changed_at || incoming.status_event_at || incoming.last_updated_at || '';
+
+    const setOnce = (field, want) => {
+      if (st === want && at && !current[field]) merged[field] = at;
+    };
+    setOnce('ordered_at',   'Ordered');
+    setOnce('shipped_at',   'Shipped');
+    setOnce('delivered_at', 'Delivered');
+
     sh.getRange(row, 1, 1, hdrs.length).setValues([objToRow_(hdrs, merged)]);
     cache.set(row, merged);
   }
@@ -879,105 +1087,41 @@ function extractSeller_(html, plain) {
 // Line-item extraction
 //////////////////////////////
 
-function extractLineItems_(html, plain) {
+function extractLineItems_(plain) {
   const items = [];
-  const seen = new Set();
-  const H = String(html || '').replace(/\s+/g, ' '); // normalize
+  if (!plain) return items;
 
-  // --- split into order sections (robust to tags/RTL markers) ---
-  const sections = [];
-  const orderRe = /Order\s*#(?:[^0-9]{0,80}?)(\d{3}-\d{7}-\d{7})/gi;
-  let m;
-  const starts = [];
-  while ((m = orderRe.exec(H))) starts.push(m.index);
-  if (starts.length === 0) starts.push(0);
-  for (let i = 0; i < starts.length; i++) {
-    const start = starts[i];
-    let end = i + 1 < starts.length ? starts[i + 1] : H.length;
-    const cut = H.slice(start, end).search(/(?:Continue shopping|Keep shopping|By placing your order|Privacy Notice|Conditions of Use|tax and seller information)/i);
-    if (cut !== -1) end = start + cut;
-    sections.push(H.slice(start, end));
-  }
+  const lines = plain.split(/\n+/).map(l => l.trim()).filter(Boolean);
 
-  const blacklist = /your orders|your account|buy again|track package|view (?:or )?edit order|view and manage|order details|sign in|help|privacy notice|conditions of use/i;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('*')) {
+      const title = lines[i].replace(/^\*\s*/, '').trim();
+      let quantity = 1;
+      let price = null;
 
-  const pickPrice = (s) => {
-    let mm = s.match(/([\$€£]\s?\d{1,3}(?:,\d{3})*(?:\.\d{2}))/);
-    if (mm) return mm[1];
-    mm = s.match(/([\$€£]\s?\d{1,3}(?:,\d{3})*)(?:\s*<\/?[^>]*sup[^>]*>\s*(\d{2})\s*<\/?[^>]*sup[^>]*>)/i);
-    if (mm) return mm[1] + '.' + mm[2];
-    mm = s.match(/([\$€£]\s?\d{1,3}(?:,\d{3})*)\s*(?:<\/?[^>]+>|\s){0,30}(\d{2})(?!\d)/i);
-    if (mm) return mm[1] + '.' + mm[2];
-    return '';
-  };
-
-  const pushItem = (title, qty, price) => {
-    title = (title || '').trim();
-    if (!title || title.length < 4 || blacklist.test(title)) return;
-    if (!price) return;
-    qty = Math.max(1, Number(qty || 1));
-    const key = `${title.toLowerCase()}::${qty}::${price}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    items.push({
-      item_title: title.slice(0, 500),
-      qty,
-      item_price: normalizeAmount_(price),
-      currency: /\$/.test(price) ? 'USD' : /€/.test(price) ? 'EUR' : /£/.test(price) ? 'GBP' : ''
-    });
-  };
-
-  // --- parse each section ---
-  const aRe = /<a\b[^>]*href="([^"]+)"[^>]*>([^<]{6,220})<\/a>/gi;
-  for (const region of sections) {
-    let ma;
-    while ((ma = aRe.exec(region))) {
-      const href = ma[1] || '';
-      let title = (ma[2] || '').replace(/\s+/g, ' ').trim();
-      if (!/\/(?:dp|gp\/product)\//i.test(href)) continue; // product-like link
-      if (!title || blacklist.test(title)) continue;
-
-      // look around the anchor for qty + price
-      const at = ma.index;
-      const win = region.slice(Math.max(0, at - 700), at + 1200);
-
-      // Quantity nearby
-      let qty = 1;
-      const mq = win.match(/\b(?:qty|quantity)\b\s*[:\-]?\s*(\d+)/i);
-      if (mq) qty = Number(mq[1]) || 1;
-
-      // Price nearby
-      const price = pickPrice(win) || pickPrice(region.slice(at, at + 1500));
-      if (!price) continue;
-
-      pushItem(title, qty, price);
-    }
-  }
-
-  // --- plaintext fallback ("1 x Title — $9.99") ---
-  if (!items.length && plain) {
-    const lines = String(plain).split('\n').map(s => s.trim()).filter(Boolean);
-    for (let i = 0; i < lines.length; i++) {
-      let t = lines[i];
-      if (/^(order|arriving|delivered|tracking|ship|estimate|keep shopping|privacy|conditions)/i.test(t)) continue;
-
-      let qty = 1, price = '';
-      const mLead = t.match(/^(\d+)\s*x\s+(.{6,})/i);
-      if (mLead) { qty = Number(mLead[1]) || 1; t = mLead[2].trim(); }
-      const mpHere = t.match(/([\$€£]\s?\d{1,3}(?:,\d{3})*(?:\.\d{2}))/);
-      if (mpHere) price = mpHere[1];
-      if (!price) {
-        for (let j = 1; j <= 3 && i + j < lines.length; j++) {
-          const L = lines[i + j];
-          const mq2 = L.match(/\b(?:qty|quantity)\b\s*[:\-]?\s*(\d+)/i); if (mq2) qty = Number(mq2[1]) || qty;
-          const mp2 = L.match(/([\$€£]\s?\d{1,3}(?:,\d{3})*(?:\.\d{2}))/); if (mp2) { price = mp2[1]; break; }
-        }
+      // look ahead for quantity
+      if (i + 1 < lines.length && /^quantity/i.test(lines[i + 1])) {
+        const m = lines[i + 1].match(/(\d+)/);
+        if (m) quantity = parseInt(m[1], 10);
       }
-      if (price && t.length >= 8 && !blacklist.test(t)) pushItem(t, qty, price);
+
+      // look ahead for price
+      if (i + 2 < lines.length && /\d+(\.\d{2})?\s*USD/i.test(lines[i + 2])) {
+        const m = lines[i + 2].match(/([\d,.]+\.\d{2})/);
+        if (m) price = parseFloat(m[1]);
+      }
+
+      items.push({ title, quantity, price });
     }
   }
 
   return items;
+}
+function extractOrderViewLink_(plain) {
+  if (!plain) return '';
+  const re = /(https:\/\/www\.amazon\.com\/gp\/css\/order-details\?orderID=[^\s]+)/i;
+  const m = plain.match(re);
+  return m ? m[1] : '';
 }
 
 //////////////////////////////
@@ -1085,60 +1229,9 @@ function summarizeItemsForOrderRow_(items) {
   };
 }
 
-//////////////////////////////
-// Misc helpers for items merge keys
-//////////////////////////////
-
-function _normTitle_(t) {
-  return String(t || '')
-    .toLowerCase()
-    .replace(/&amp;/g, '&')
-    .replace(/[^a-z0-9$€£.\-\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-function _itemKey_(title, unitPrice) {
-  const p = (unitPrice != null && isFinite(Number(unitPrice))) ? Number(unitPrice).toFixed(2) : '';
-  return _normTitle_(title) + ' :: ' + p;
-}
-function mergeItemArrays_(existing = [], incoming = []) {
-  const out = [];
-  const idx = new Map(); // key -> index
-  const add = (it) => {
-    const qty  = Math.max(1, Number(it.qty || 1));
-    const unit = (it.item_price !== '' && it.item_price != null) ? Number(it.item_price) : NaN;
-    const key  = _itemKey_(it.item_title, unit);
-    if (!idx.has(key)) {
-      const row = {
-        item_title: it.item_title || '',
-        qty,
-        item_price: isFinite(unit) ? +unit.toFixed(2) : '',
-        currency: it.currency || ''
-      };
-      idx.set(key, out.length);
-      out.push(row);
-    } else {
-      out[idx.get(key)].qty += qty; // increment qty when same item shows up again
-    }
-  };
-  existing.forEach(add);
-  incoming.forEach(add);
+function ensureOrderShape_(partial) {
+  const out = Object.assign({}, ORDER_DEFAULTS, partial || {});
+  // never let undefined/null leak to Sheets – coerce to '' for scalars
+  for (const k in out) if (out[k] == null) out[k] = '';
   return out;
-}
-
-//////////////////////////////
-// Legacy helpers used by extractLineItems_
-//////////////////////////////
-
-function _cleanHtml_(html) {
-  return String(html || '')
-    .replace(/\s+/g, ' ')
-    .replace(/<img[^>]+?amazon\.(?:com|ca|co\.uk|de|fr|it|es|com\.au)[^>]*?>/gi, m => m);
-}
-function _pickPriceFromWindow_(win) {
-  let m = win.match(/([\$€£]\s?\d{1,3}(?:,\d{3})*(?:\.\d{2}))/);
-  if (m) return m[1];
-  m = win.match(/([\$€£]\s?\d{1,3}(?:,\d{3})*)(?:\s*<\/?[^>]*sup[^>]*>\s*(\d{2})\s*<\/?[^>]*sup[^>]*>)/i);
-  if (m) return m[1] + '.' + m[2];
-  return '';
 }
